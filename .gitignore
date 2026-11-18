@@ -1,0 +1,19 @@
+# build output
+out/
+*.obj
+*.exp
+*.lib
+*.asi
+*.dll
+*.pdb
+__pycache__/
+# derived from the game executable / game screenshots / logs: not distributed
+ref/
+test/shots/
+*.png
+*.jpg
+*.log
+*.dmp
+*.ini
+# per-session notes
+.claude/

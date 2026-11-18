@@ -1,0 +1,192 @@
+// More Options for Saints Row The Third (DX11) - ASI plugin. Needs SR3 Mod UI 2+ (SR3ModUI.asi).
+//  * Display mode gets a third choice, BORDERLESS (the Lua part adds the row choice; this part restyles the window)
+//  * FPS limit row at the end of Options > Display (limiter in IDXGISwapChain::Present)
+// Settings file: MoreOptionsSRTT.ini next to the game exe.
+#include <windows.h>
+#include <d3d11.h>
+#include <dxgi.h>
+#include <dxgi1_2.h>
+#include <cstdio>
+#include <cstdarg>
+#include <cstdlib>
+#include <atomic>
+#include "sr3modui.h"
+
+static char g_ini[MAX_PATH];
+static std::atomic<int> g_border{0};
+static std::atomic<int> g_fps{0};
+static const int FPS_VALUES[] = { 0, 30, 60, 75, 90, 120, 144, 165, 240 };
+static const int FPS_COUNT = sizeof FPS_VALUES / sizeof FPS_VALUES[0];
+
+static void say(const char* fmt, ...) {
+    char b[400]; va_list a; va_start(a, fmt); vsnprintf(b, sizeof b, fmt, a); va_end(a);
+    ModUI.Log("moreoptions", b);
+}
+static int iniGet(const char* k, int d) { return (int)GetPrivateProfileIntA("Display", k, d, g_ini); }
+static void iniSet(const char* k, int v) { char s[16]; snprintf(s, sizeof s, "%d", v); WritePrivateProfileStringA("Display", k, s, g_ini); }
+
+// ---------------------------------------------------------------- borderless
+struct Styled { bool on = false; LONG_PTR style = 0, ex = 0; };
+static Styled g_orig;
+
+static HWND findGameWindow() {
+    struct Ctx { DWORD pid; HWND found; } c = { GetCurrentProcessId(), nullptr };
+    EnumWindows([](HWND w, LPARAM p) -> BOOL {
+        Ctx* c = (Ctx*)p; DWORD pid = 0; GetWindowThreadProcessId(w, &pid);
+        if (pid != c->pid || !IsWindowVisible(w) || GetWindow(w, GW_OWNER)) return TRUE;
+        RECT r; GetClientRect(w, &r);
+        if (r.right < 320 || r.bottom < 200) return TRUE;
+        c->found = w; return FALSE;
+    }, (LPARAM)&c);
+    return c.found;
+}
+
+static void centre(HWND w, int cw, int ch) {
+    HMONITOR m = MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi = { sizeof mi }; GetMonitorInfo(m, &mi);
+    int mw = mi.rcMonitor.right - mi.rcMonitor.left, mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
+    int x = mi.rcMonitor.left + (mw - cw) / 2, y = mi.rcMonitor.top + (mh - ch) / 2;
+    SetWindowPos(w, HWND_TOP, x, y, cw, ch, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+}
+
+static void borderlessTick() {
+    HWND w = findGameWindow();
+    if (!w) return;
+    LONG_PTR style = GetWindowLongPtr(w, GWL_STYLE);
+    if (g_border.load()) {
+        if (style & WS_CAPTION) {                       // windowed with a frame: remove it, keep the client size
+            RECT cr; GetClientRect(w, &cr);
+            int cw = cr.right - cr.left, ch = cr.bottom - cr.top;
+            {   // a framed window can be a few rows short of the screen: fill the monitor then
+                MONITORINFO mi = { sizeof mi }; GetMonitorInfo(MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST), &mi);
+                int mw = mi.rcMonitor.right - mi.rcMonitor.left, mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
+                if (cw >= mw - 8 && ch >= mh - 48) { cw = mw; ch = mh; }
+            }
+            g_orig.on = true; g_orig.style = style; g_orig.ex = GetWindowLongPtr(w, GWL_EXSTYLE);
+            SetWindowLongPtr(w, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+            SetWindowLongPtr(w, GWL_EXSTYLE, g_orig.ex & ~(LONG_PTR)(WS_EX_DLGMODALFRAME | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE | WS_EX_WINDOWEDGE));
+            centre(w, cw, ch);
+            say("borderless on: %dx%d", cw, ch);
+        }
+    } else if (g_orig.on) {                              // back to the framed window
+        RECT cr; GetClientRect(w, &cr);
+        int cw = cr.right - cr.left, ch = cr.bottom - cr.top;
+        SetWindowLongPtr(w, GWL_STYLE, g_orig.style);
+        SetWindowLongPtr(w, GWL_EXSTYLE, g_orig.ex);
+        RECT r = { 0, 0, cw, ch };
+        AdjustWindowRectEx(&r, (DWORD)g_orig.style, FALSE, (DWORD)g_orig.ex);
+        centre(w, r.right - r.left, r.bottom - r.top);
+        g_orig.on = false;
+        say("borderless off");
+    }
+}
+
+// ---------------------------------------------------------------- FPS limiter
+typedef HRESULT (STDMETHODCALLTYPE *Present_t)(IDXGISwapChain*, UINT, UINT);
+typedef HRESULT (STDMETHODCALLTYPE *Present1_t)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
+static Present_t  g_present  = nullptr;
+static Present1_t g_present1 = nullptr;
+static LARGE_INTEGER g_freq, g_next;
+static thread_local int g_depth = 0;
+
+static void limit() {
+    int fps = g_fps.load();
+    if (fps <= 0) { g_next.QuadPart = 0; return; }
+    LONGLONG step = g_freq.QuadPart / fps;
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    if (g_next.QuadPart == 0 || now.QuadPart - g_next.QuadPart > step * 4) g_next.QuadPart = now.QuadPart;   // resync after a stall
+    for (;;) {
+        QueryPerformanceCounter(&now);
+        LONGLONG left = g_next.QuadPart - now.QuadPart;
+        if (left <= 0) break;
+        if (left * 1000 / g_freq.QuadPart >= 2) Sleep(1); else YieldProcessor();
+    }
+    g_next.QuadPart += step;
+}
+static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* s, UINT sync, UINT flags) {
+    if (g_depth++ == 0) limit();
+    HRESULT r = g_present(s, sync, flags); g_depth--; return r;
+}
+static HRESULT STDMETHODCALLTYPE hkPresent1(IDXGISwapChain1* s, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* p) {
+    if (g_depth++ == 0) limit();
+    HRESULT r = g_present1(s, sync, flags, p); g_depth--; return r;
+}
+static bool patchSlot(void** slot, void* hook, void** orig) {
+    DWORD old; if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old)) return false;
+    if (*slot == hook) { VirtualProtect(slot, sizeof(void*), old, &old); return true; }
+    *orig = *slot; *slot = hook; VirtualProtect(slot, sizeof(void*), old, &old); return true;
+}
+static bool hookPresent() {
+    WNDCLASSA wc = {}; wc.lpfnWndProc = DefWindowProcA; wc.hInstance = GetModuleHandle(nullptr); wc.lpszClassName = "MoreOptsDummy";
+    RegisterClassA(&wc);
+    HWND w = CreateWindowA("MoreOptsDummy", "", WS_OVERLAPPED, 0, 0, 64, 64, nullptr, nullptr, wc.hInstance, nullptr);
+    DXGI_SWAP_CHAIN_DESC d = {}; d.BufferCount = 1; d.BufferDesc.Width = 64; d.BufferDesc.Height = 64;
+    d.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    d.OutputWindow = w; d.SampleDesc.Count = 1; d.Windowed = TRUE;
+    IDXGISwapChain* sc = nullptr; ID3D11Device* dev = nullptr; ID3D11DeviceContext* ctx = nullptr;
+    HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &d, &sc, &dev, nullptr, &ctx);
+    bool ok = false;
+    if (SUCCEEDED(hr) && sc) {
+        void** vt = *(void***)sc;
+        ok = patchSlot(&vt[8], (void*)hkPresent, (void**)&g_present);
+        IDXGISwapChain1* sc1 = nullptr;
+        if (SUCCEEDED(sc->QueryInterface(__uuidof(IDXGISwapChain1), (void**)&sc1)) && sc1) {
+            void** vt1 = *(void***)sc1;
+            patchSlot(&vt1[22], (void*)hkPresent1, (void**)&g_present1);
+            sc1->Release();
+        }
+    }
+    if (sc) sc->Release();
+    if (ctx) ctx->Release();
+    if (dev) dev->Release();
+    DestroyWindow(w); UnregisterClassA("MoreOptsDummy", wc.hInstance);
+    say("Present hook: %s (hr=%08lx, present1=%s)", ok ? "installed" : "FAILED", (unsigned long)hr, g_present1 ? "yes" : "no");
+    return ok;
+}
+
+// ---------------------------------------------------------------- UI glue
+static void __cdecl onFps(const char*, const char*, double v, void*) {
+    int i = (int)v; if (i < 0 || i >= FPS_COUNT) i = 0;
+    g_fps = FPS_VALUES[i]; iniSet("FpsLimit", FPS_VALUES[i]);
+    say("FPS limit = %d", FPS_VALUES[i]);
+}
+static void __cdecl hGet(SR3ModUI_Call* c, void*) {
+    const char* n = ModUI.ArgString(c, 1);
+    ModUI.ReturnNumber(c, (n && !strcmp(n, "borderless")) ? g_border.load() : 0);
+}
+static void __cdecl hSetBorderless(SR3ModUI_Call* c, void*) {
+    int v = ModUI.ArgNumber(c, 1) != 0;
+    g_border = v; iniSet("Borderless", v);
+    say("borderless = %d", v);
+}
+
+static DWORD WINAPI worker(LPVOID) {
+    QueryPerformanceFrequency(&g_freq);
+    Sleep(3000);                                          // let the game create its device
+    hookPresent();
+    for (;;) { borderlessTick(); Sleep(250); }
+    return 0;
+}
+
+BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
+    if (reason != DLL_PROCESS_ATTACH) return TRUE;
+    DisableThreadLibraryCalls(inst);
+    GetModuleFileNameA(nullptr, g_ini, MAX_PATH);
+    char* s = strrchr(g_ini, '\\'); if (s) *(s + 1) = 0; strcat(g_ini, "MoreOptionsSRTT.ini");
+    if (GetFileAttributesA(g_ini) == INVALID_FILE_ATTRIBUTES) {
+        WritePrivateProfileStringA("Display", "Borderless", "0", g_ini);
+        WritePrivateProfileStringA("Display", "FpsLimit", "0", g_ini);
+    }
+    g_border = iniGet("Borderless", 0);
+    g_fps = iniGet("FpsLimit", 0);
+    if (!SR3ModUI_Load()) return TRUE;                    // SR3 Mod UI missing: settings from the ini only
+    int def = 0; for (int i = 0; i < FPS_COUNT; i++) if (FPS_VALUES[i] == g_fps.load()) def = i;
+    ModUI.AddPage("moreopts_display", "More Options");
+    ModUI.AddChoice("moreopts_display", "fps", "FPS limit", "Off|30|60|75|90|120|144|165|240", def, onFps, nullptr);
+    ModUI.SetValue("moreopts_display", "fps", def);       // the ini is the source of truth
+    ModUI.AttachPage("moreopts_display", "display", 0);
+    ModUI.RegisterHandler("moreopts_get", hGet, nullptr);
+    ModUI.RegisterHandler("moreopts_set_borderless", hSetBorderless, nullptr);
+    CreateThread(nullptr, 0, worker, nullptr, 0, nullptr);
+    return TRUE;
+}
