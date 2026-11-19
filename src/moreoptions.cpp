@@ -122,6 +122,12 @@ static bool patchSlot(void** slot, void* hook, void** orig) {
     if (*slot == hook) { VirtualProtect(slot, sizeof(void*), old, &old); return true; }
     *orig = *slot; *slot = hook; VirtualProtect(slot, sizeof(void*), old, &old); return true;
 }
+static HRESULT STDMETHODCALLTYPE hkCreateTex2D(ID3D11Device*, const D3D11_TEXTURE2D_DESC*, const D3D11_SUBRESOURCE_DATA*, ID3D11Texture2D**);
+typedef HRESULT (STDMETHODCALLTYPE *CreateSRV_t)(ID3D11Device*, ID3D11Resource*, const D3D11_SHADER_RESOURCE_VIEW_DESC*, ID3D11ShaderResourceView**);
+static CreateSRV_t g_createSRV = nullptr;
+static HRESULT STDMETHODCALLTYPE hkCreateSRV(ID3D11Device*, ID3D11Resource*, const D3D11_SHADER_RESOURCE_VIEW_DESC*, ID3D11ShaderResourceView**);
+typedef HRESULT (STDMETHODCALLTYPE *CreateTex2D_t)(ID3D11Device*, const D3D11_TEXTURE2D_DESC*, const D3D11_SUBRESOURCE_DATA*, ID3D11Texture2D**);
+static CreateTex2D_t g_createTex2D = nullptr;
 static bool hookPresent() {
     WNDCLASSA wc = {}; wc.lpfnWndProc = DefWindowProcA; wc.hInstance = GetModuleHandle(nullptr); wc.lpszClassName = "MoreOptsDummy";
     RegisterClassA(&wc);
@@ -133,6 +139,7 @@ static bool hookPresent() {
     HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &d, &sc, &dev, nullptr, &ctx);
     bool ok = false;
     if (SUCCEEDED(hr) && sc) {
+        { void** dvt = *(void***)dev; patchSlot(&dvt[5], (void*)hkCreateTex2D, (void**)&g_createTex2D); patchSlot(&dvt[7], (void*)hkCreateSRV, (void**)&g_createSRV); }
         void** vt = *(void***)sc;
         ok = patchSlot(&vt[8], (void*)hkPresent, (void**)&g_present);
         IDXGISwapChain1* sc1 = nullptr;
@@ -150,11 +157,84 @@ static bool hookPresent() {
     return ok;
 }
 
+
+// ---------------------------------------------------------------- texture resolution
+// The engine creates its world textures as IMMUTABLE textures with initial data for the whole mip chain. To lower the
+// resolution we create the texture from a lower mip instead (smaller Width/Height, fewer mips, pInitialData advanced
+// by the skipped mips). UVs are normalised, so nothing else changes. Only plain shader-resource 2D textures with a
+// mip chain are touched (no cube maps, arrays, render targets, UI textures without mips), and the result never drops
+// below 128 texels on its longest side.
+#include <unordered_map>
+static SRWLOCK g_shiftLock = SRWLOCK_INIT;
+static std::unordered_map<void*, unsigned char> g_shifted;     // texture -> mips skipped (only textures we made smaller)
+static void markShift(void* tex, unsigned s) {
+    AcquireSRWLockExclusive(&g_shiftLock);
+    if (s) g_shifted[tex] = (unsigned char)s; else g_shifted.erase(tex);        // a new texture at a reused address clears the old entry
+    ReleaseSRWLockExclusive(&g_shiftLock);
+}
+static unsigned shiftOf(void* tex) {
+    AcquireSRWLockShared(&g_shiftLock);
+    auto it = g_shifted.find(tex); unsigned s = it == g_shifted.end() ? 0 : it->second;
+    ReleaseSRWLockShared(&g_shiftLock);
+    return s;
+}
+static std::atomic<int> g_texShift{0};            // 0 full, 1 half, 2 quarter
+static std::atomic<unsigned> g_texCut{0};
+static std::atomic<unsigned long long> g_texSaved{0};
+
+static HRESULT STDMETHODCALLTYPE hkCreateTex2D(ID3D11Device* d, const D3D11_TEXTURE2D_DESC* desc, const D3D11_SUBRESOURCE_DATA* init, ID3D11Texture2D** out) {
+    int want = g_texShift.load();
+    if (want > 0 && desc && init && desc->BindFlags == D3D11_BIND_SHADER_RESOURCE && desc->ArraySize == 1 &&
+        desc->MipLevels > 1 && !(desc->MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) && desc->SampleDesc.Count == 1 &&
+        (desc->Usage == D3D11_USAGE_IMMUTABLE || desc->Usage == D3D11_USAGE_DEFAULT)) {
+        UINT longest = desc->Width > desc->Height ? desc->Width : desc->Height;
+        UINT s = 0;
+        while ((int)s < want && (longest >> (s + 1)) >= 128 && s + 1 < desc->MipLevels) s++;
+        if (s > 0) {
+            D3D11_TEXTURE2D_DESC nd = *desc;
+            nd.Width = desc->Width >> s; nd.Height = desc->Height >> s; nd.MipLevels = desc->MipLevels - s;
+            if (nd.Width == 0) nd.Width = 1;
+            if (nd.Height == 0) nd.Height = 1;
+            HRESULT hr = g_createTex2D(d, &nd, init + s, out);
+            if (SUCCEEDED(hr)) {
+                if (out && *out) markShift(*out, s);
+                g_texCut++;
+                return hr;
+            }                                                   // fall through: create it unchanged
+        }
+    }
+    HRESULT hr = g_createTex2D(d, desc, init, out);
+    if (SUCCEEDED(hr) && out && *out) markShift(*out, 0);
+    return hr;
+}
+
+// Views of a shrunk texture: the engine asks for the original mip range, so move it down by the skipped mips.
+static HRESULT STDMETHODCALLTYPE hkCreateSRV(ID3D11Device* d, ID3D11Resource* res, const D3D11_SHADER_RESOURCE_VIEW_DESC* desc, ID3D11ShaderResourceView** out) {
+    unsigned s = (res && desc) ? shiftOf(res) : 0;
+    if (s) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC nd = *desc;
+        UINT* most = nullptr; UINT* cnt = nullptr;
+        if (nd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D) { most = &nd.Texture2D.MostDetailedMip; cnt = &nd.Texture2D.MipLevels; }
+        else if (nd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY) { most = &nd.Texture2DArray.MostDetailedMip; cnt = &nd.Texture2DArray.MipLevels; }
+        if (most) {
+            *most = *most > s ? *most - s : 0;
+            if (*cnt != (UINT)-1) *cnt = *cnt > s ? *cnt - s : 1;
+            return g_createSRV(d, res, &nd, out);
+        }
+    }
+    return g_createSRV(d, res, desc, out);
+}
+
 // ---------------------------------------------------------------- UI glue
 static void __cdecl onFps(const char*, const char*, double v, void*) {
     int i = (int)v; if (i < 0 || i >= FPS_COUNT) i = 0;
     g_fps = FPS_VALUES[i]; iniSet("FpsLimit", FPS_VALUES[i]);
     say("FPS limit = %d", FPS_VALUES[i]);
+}
+static void __cdecl onTex(const char*, const char*, double v, void*) {
+    int i = (int)v; if (i < 0 || i > 2) i = 0;
+    g_texShift = i; iniSet("TextureResolution", i);
+    say("texture resolution = %d (applies to textures created from now on)", i);
 }
 static void __cdecl hGet(SR3ModUI_Call* c, void*) {
     const char* n = ModUI.ArgString(c, 1);
@@ -170,7 +250,11 @@ static DWORD WINAPI worker(LPVOID) {
     QueryPerformanceFrequency(&g_freq);
     Sleep(3000);                                          // let the game create its device
     hookPresent();
-    for (;;) { borderlessTick(); Sleep(250); }
+    unsigned lastCut = 0; int tick = 0;
+    for (;;) {
+        borderlessTick(); Sleep(250);
+        if (++tick % 40 == 0) { unsigned c = g_texCut.load(); if (c != lastCut) { say("textures made smaller so far: %u", c); lastCut = c; } }
+    }
     return 0;
 }
 
@@ -208,15 +292,19 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
     if (GetFileAttributesA(g_ini) == INVALID_FILE_ATTRIBUTES) {
         WritePrivateProfileStringA("Display", "Borderless", "0", g_ini);
         WritePrivateProfileStringA("Display", "FpsLimit", "0", g_ini);
+        WritePrivateProfileStringA("Display", "TextureResolution", "0", g_ini);
     }
     g_border = iniGet("Borderless", 0);
     g_fps = iniGet("FpsLimit", 0);
+    g_texShift = iniGet("TextureResolution", 0);
     if (!SR3ModUI_Load()) return TRUE;                    // SR3 Mod UI missing: settings from the ini only
     installLua();
     int def = 0; for (int i = 0; i < FPS_COUNT; i++) if (FPS_VALUES[i] == g_fps.load()) def = i;
     ModUI.AddPage("moreopts_display", "More Options");
     ModUI.AddChoice("moreopts_display", "fps", "FPS limit", "Off|30|60|75|90|120|144|165|240", def, onFps, nullptr);
     ModUI.SetValue("moreopts_display", "fps", def);       // the ini is the source of truth
+    ModUI.AddChoice("moreopts_display", "tex", "Texture resolution", "Full|Half|Quarter", g_texShift.load(), onTex, nullptr);
+    ModUI.SetValue("moreopts_display", "tex", g_texShift.load());
     ModUI.AttachPage("moreopts_display", "display", 0);
     ModUI.RegisterHandler("moreopts_get", hGet, nullptr);
     ModUI.RegisterHandler("moreopts_set_borderless", hSetBorderless, nullptr);

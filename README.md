@@ -17,6 +17,7 @@ DISPLAY
 | Setting | What it does |
 |---|---|
 | **Display mode: Borderless** | Windowed without the title bar and frame, centred on its monitor (or filling it when the resolution matches the screen). Choose it, press Apply. Choosing Windowed or Full screen puts the frame back. |
+| **Texture resolution** (experimental, source only) | Full, Half or Quarter: creates the game's mipmapped textures from a lower mip to save video memory. Takes effect for textures loaded after the change (restart to apply everywhere). Not verified in game yet and not in the release build, so leave it on Full unless you build it yourself. |
 | **FPS limit** | Off, 30, 60, 75, 90, 120, 144, 165 or 240. A frame limiter in the swap chain's `Present`; useful with V-Sync off. |
 
 Settings are saved to **`MoreOptionsSRTT.ini`** next to the game executable (created on first start):
