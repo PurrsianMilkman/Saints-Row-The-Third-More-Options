@@ -1,4 +1,4 @@
-# More Options for Saints Row The Third
+﻿# More Options for Saints Row The Third
 
 Extra display settings for **Saints Row: The Third (PC, DX11)**, added to the game's own
 **Options > Display** screen with [SR3 Mod UI](https://github.com/PurrsianMilkman/Saints-Row-The-Third-Mod-UI).
@@ -32,16 +32,13 @@ separate shadow toggle yet. More graphics toggles are planned.
 
 ## Install
 
-Requirements: `SaintsRowTheThird_DX11.exe`, an ASI loader (`dinput8.dll`, e.g. Ultimate ASI Loader) and
-**SR3 Mod UI 2 or newer** installed first (see its README).
+1. Install [SR3 Mod UI](https://github.com/PurrsianMilkman/Saints-Row-The-Third-Mod-UI) (2 or newer) and an ASI loader
+   (`dinput8.dll`, e.g. Ultimate ASI Loader), if you don't have them.
+2. Download **`MoreOptionsSRTT.asi`** from the [latest release](https://github.com/PurrsianMilkman/Saints-Row-The-Third-More-Options/releases/latest) and copy it next to `SaintsRowTheThird_DX11.exe`.
 
-```
-powershell -ExecutionPolicy Bypass -File install.ps1 -Game "<your Saints Row The Third folder>"
-```
-
-This copies `MoreOptionsSRTT.asi` and `SR3ModUI\mods\moreoptions.lua` into the game folder. Build the plugin
-yourself with `build.bat` (Visual Studio 2022 Build Tools, x86). Remove it with `-Uninstall` (your
-`MoreOptionsSRTT.ini` is kept). Log: `SR3ModUI.log` in the game folder (lines tagged `[moreoptions]`).
+That's all: the plugin sets up its own script on first start. To remove it, delete `MoreOptionsSRTT.asi` and
+`SR3ModUI\mods\moreoptions.lua` (your `MoreOptionsSRTT.ini` is kept). To build it yourself, run `build.bat`
+(Visual Studio 2022 Build Tools, x86). Log: `SR3ModUI.log` (lines tagged `[moreoptions]`).
 
 ## Status
 
@@ -52,7 +49,7 @@ Borderless choice. Windowed Borderless is the only supported way to use it (excl
 
 ## How it works
 
-`moreoptions.lua` adds the third choice to the Display mode row with `ModUI.modify`, tells the plugin what was chosen
+The script embedded in the plugin (`lua/moreoptions.lua`) adds the third choice to the Display mode row with `ModUI.modify`, tells the plugin what was chosen
 when Apply runs (the game itself only ever sees "Windowed"), and the plugin restyles the game window (popup style, centred).
 `MoreOptionsSRTT.asi` also hooks `IDXGISwapChain::Present` for the limiter and registers the FPS row with
 `ModUI.AttachPage("moreopts_display", "display")`.

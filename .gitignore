@@ -17,3 +17,4 @@ test/shots/
 *.ini
 # per-session notes
 .claude/
+src/lua_embed.h
