@@ -5,6 +5,8 @@
 local ID_WINDOW_MODE = 6
 local Sel = false		-- the row currently shows Borderless
 local Fresh = false	-- the screen was just opened: derive the choice from the saved setting
+local Busy = false	-- an apply is in flight (see below)
+local Busy_at = 0
 
 local function get_row()
 	local l = ModUI.get_global("List")
@@ -28,6 +30,7 @@ end)
 
 ModUI.wrap("pause_options_display_pc_init", function(orig, ...)
 	Fresh = true
+	Busy = false
 	return orig(...)
 end)
 
@@ -42,8 +45,33 @@ ModUI.wrap("options_display_nav_left_or_right", function(orig, direction)
 	return r
 end)
 
+-- One apply at a time. An apply starts a resolution change and a "keep these settings?" dialog with its own
+-- timer thread; a second apply while that is pending overlaps them and can crash the game. So while one is
+-- in flight further applies are ignored, until the dialog is answered (options_display_confirm) or 20 s pass.
+local function now()
+	local f = ModUI.get_global("vint_get_time_index")
+	if f == nil then return 0 end
+	return f()
+end
+
+ModUI.wrap("options_display_confirm", function(orig, ...)
+	Busy = false
+	local r = orig(...)		-- a "No" re-applies the old settings inside this call
+	Busy = false
+	return r
+end)
+
+local function clear_busy(orig, ...)
+	Busy = false
+	return orig(...)
+end
+ModUI.wrap("pause_options_display_pc_cleanup", clear_busy)
+
 -- Apply: the game must see Windowed; we tell the plugin what the player really chose
 ModUI.wrap("options_display_update_option_value", function(orig, ...)
+	if Busy and now() - Busy_at < 20 then return end		-- an apply is already running: ignore this one
+	Busy = true
+	Busy_at = now()
 	local it = get_row()
 	local want = Sel
 	if it ~= nil and want and it.current_value == 3 then it.current_value = 2 end

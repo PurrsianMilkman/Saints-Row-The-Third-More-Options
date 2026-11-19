@@ -45,7 +45,8 @@ yourself with `build.bat` (Visual Studio 2022 Build Tools, x86). Remove it with 
 
 ## Status
 
-Tested in game (keyboard): the Borderless choice appears and applies, and the FPS limit row saves to the ini.
+Tested in game (keyboard): the Borderless choice appears and applies, the FPS limit row saves to the ini, and pressing Apply
+rapidly is safe (only one apply runs at a time; extra presses are ignored until the "keep these settings?" dialog is answered).
 Not tested yet: mouse and controller on the new rows, other monitors, true full screen, Cancel/Revert of an unapplied
 Borderless choice. Windowed Borderless is the only supported way to use it (exclusive full screen ignores it).
 

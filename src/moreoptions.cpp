@@ -46,13 +46,18 @@ static void centre(HWND w, int cw, int ch) {
     MONITORINFO mi = { sizeof mi }; GetMonitorInfo(m, &mi);
     int mw = mi.rcMonitor.right - mi.rcMonitor.left, mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
     int x = mi.rcMonitor.left + (mw - cw) / 2, y = mi.rcMonitor.top + (mh - ch) / 2;
-    SetWindowPos(w, HWND_TOP, x, y, cw, ch, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    SetWindowPos(w, HWND_TOP, x, y, cw, ch, SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
 }
 
 static void borderlessTick() {
-    HWND w = findGameWindow();
-    if (!w) return;
+    static int pending = 0;                              // the change must be wanted on two ticks in a row, so the
+    HWND w = findGameWindow();                           // engine has finished its own resize before we touch the window
+    if (!w) { pending = 0; return; }
     LONG_PTR style = GetWindowLongPtr(w, GWL_STYLE);
+    bool wantChange = g_border.load() ? (style & WS_CAPTION) != 0 : g_orig.on;
+    if (!wantChange) { pending = 0; return; }
+    if (++pending < 2) return;
+    pending = 0;
     if (g_border.load()) {
         if (style & WS_CAPTION) {                       // windowed with a frame: remove it, keep the client size
             RECT cr; GetClientRect(w, &cr);
